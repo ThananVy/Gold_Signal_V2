@@ -36,44 +36,20 @@ LONDON_END   = (11, 30)
 NY_START     = (12, 30)
 NY_END       = (16, 30)
 
-MAX_SIGNALS_PER_SESSION = 2
-
 # Set True to send one forced test alert immediately and exit (ignores sessions & setup rules)
 TEST_MODE = False
-
-# Track daily quotas per (symbol, session)
-session_tracker = {
-    "date": None,
-    "counts": {}
-}
 
 # ================= Session & Quota Helper =================
 def get_active_session():
     """Returns 'London', 'New York', or None based on current UTC time."""
     now_utc = datetime.now(timezone.utc)
     current_time = (now_utc.hour, now_utc.minute)
-    today_str = now_utc.strftime("%Y-%m-%d")
-
-    # Reset quotas on a new trading day
-    if session_tracker["date"] != today_str:
-        session_tracker["date"] = today_str
-        session_tracker["counts"] = {}
 
     if LONDON_START <= current_time <= LONDON_END:
         return "London"
     if NY_START <= current_time <= NY_END:
         return "New York"
     return None
-
-def get_signal_count(symbol: str, session_name: str) -> int:
-    return session_tracker["counts"].get((symbol, session_name), 0)
-
-def can_send_signal(symbol: str, session_name: str) -> bool:
-    return get_signal_count(symbol, session_name) < MAX_SIGNALS_PER_SESSION
-
-def record_sent_signal(symbol: str, session_name: str):
-    key = (symbol, session_name)
-    session_tracker["counts"][key] = session_tracker["counts"].get(key, 0) + 1
 
 # ================= Indicators =================
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -216,10 +192,9 @@ def generate_chart_bytes(df: pd.DataFrame, signal_info: dict) -> io.BytesIO:
 def send_telegram_alert(signal_info: dict, chart_buffer: io.BytesIO):
     emoji = "🟢" if signal_info["action"] == "BUY" else "🔴"
     symbol = signal_info["symbol"]
-    session_count = get_signal_count(symbol, signal_info["session"])
 
     caption = (
-        f"{emoji} <b>{signal_info['session'].upper()} SESSION SIGNAL ({session_count}/{MAX_SIGNALS_PER_SESSION})</b>\n\n"
+        f"{emoji} <b>{signal_info['session'].upper()} SESSION SIGNAL</b>\n\n"
         f"<b>Asset:</b> <code>{SYMBOLS[symbol]['name']}</code>\n"
         f"<b>Action:</b> <b>{signal_info['action']}</b>\n"
         f"🏅 <b>Confidence Score:</b> {signal_info.get('score', 100)}/100\n"
@@ -248,54 +223,43 @@ def fetch_data(symbol: str) -> pd.DataFrame:
         raw_data.columns = raw_data.columns.get_level_values(0)
     return raw_data
 
-def run_scanner():
+def run_bot():
     names = ", ".join(info["name"] for info in SYMBOLS.values())
-    print(f"[*] Starting Precision Signal Bot for {names}...")
-    print(f"[*] Configured for London & New York session windows (Max {MAX_SIGNALS_PER_SESSION} signals/session per pair).")
-    last_processed_candle = {symbol: None for symbol in SYMBOLS}
+    print(f"[*] Waking up! Starting Precision Signal Bot check for {names}...")
 
-    while True:
-        # 1. Gate: Check active session
-        active_session = get_active_session()
+    # 1. Gate: Check active session
+    active_session = get_active_session()
 
-        if active_session:
-            for symbol, info in SYMBOLS.items():
-                try:
-                    # Quota for this pair & session already reached
-                    if not can_send_signal(symbol, active_session):
-                        continue
+    if active_session:
+        for symbol, info in SYMBOLS.items():
+            try:
+                # 2. Fetch market data
+                raw_data = fetch_data(symbol)
+                if len(raw_data) < 205:
+                    print(f"[x] Not enough data for {info['name']} ({len(raw_data)} candles).")
+                    continue
 
-                    # 2. Fetch market data
-                    raw_data = fetch_data(symbol)
-                    if len(raw_data) < 205:
-                        print(f"[x] Not enough data for {info['name']} ({len(raw_data)} candles).")
-                        continue
+                # 3. Calculate indicators
+                df = compute_indicators(raw_data)
+                current_closed_time = df.iloc[-2].name
 
-                    # 3. Calculate indicators
-                    df = compute_indicators(raw_data)
-                    current_closed_time = df.iloc[-2].name
+                # 4. Check setup on freshly closed candle
+                print(f"[{time.strftime('%H:%M:%S')}] Evaluating {info['name']} candle in {active_session} Session...")
+                signal = check_signal(df, active_session, symbol)
 
-                    # 4. Check setup on freshly closed candle
-                    if current_closed_time == last_processed_candle[symbol]:
-                        continue
+                if signal:
+                    print(f"[!] {info['name']} {signal['action']} signal triggered during {active_session} session!")
+                    chart_buf = generate_chart_bytes(df, signal)
+                    send_telegram_alert(signal, chart_buf)
+                else:
+                    print(f"[-] No A+ setup on {info['name']} candle {current_closed_time}.")
 
-                    print(f"[{time.strftime('%H:%M:%S')}] Evaluating {info['name']} candle in {active_session} Session...")
-                    signal = check_signal(df, active_session, symbol)
+            except Exception as e:
+                print(f"[x] Error scanning {info['name']}: {e}")
+    else:
+        print(f"[-] Market is not in London or New York session. Sleeping.")
 
-                    if signal:
-                        record_sent_signal(symbol, active_session)
-                        print(f"[!] {info['name']} {signal['action']} signal triggered during {active_session} session!")
-                        chart_buf = generate_chart_bytes(df, signal)
-                        send_telegram_alert(signal, chart_buf)
-                    else:
-                        print(f"[-] No A+ setup on {info['name']} candle {current_closed_time}.")
-
-                    last_processed_candle[symbol] = current_closed_time
-
-                except Exception as e:
-                    print(f"[x] Error scanning {info['name']}: {e}")
-
-        time.sleep(CHECK_INTERVAL)
+    print("[*] Check complete. Exiting script.")
 
 # ================= Test Mode =================
 def run_test():
@@ -312,4 +276,4 @@ if __name__ == "__main__":
     if TEST_MODE:
         run_test()
     else:
-        run_scanner()
+        run_bot()
